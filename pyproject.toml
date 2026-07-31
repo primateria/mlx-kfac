@@ -1,13 +1,64 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-kfac"
-version = "0.3.0"
+version = "0.4.0"
 description = "A native MLX K-FAC optimizer"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["mlx>=0.25"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Emerson Hsieh" },
+]
+maintainers = [
+    { name = "Primateria" },
+]
+keywords = [
+    "mlx",
+    "kfac",
+    "optimizer",
+    "natural-gradient",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["mlx>=0.25.2,<0.33"]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<10",
+]
+release = [
+    "build>=1.2,<2",
+    "twine>=6,<7",
+]
+dev = [
+    "build>=1.2,<2",
+    "pytest>=8,<10",
+    "twine>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/primateria/mlx-kfac"
+Documentation = "https://github.com/primateria/mlx-kfac#readme"
+Repository = "https://github.com/primateria/mlx-kfac"
+Issues = "https://github.com/primateria/mlx-kfac/issues"
+Changelog = "https://github.com/primateria/mlx-kfac/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]

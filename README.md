@@ -4,6 +4,33 @@ Native Kronecker-factored approximate curvature for MLX. The implementation
 uses MLX operations only: there are no JAX/PyTorch dependencies, explicit
 matrix inverses, or custom Metal kernels.
 
+## Installation and compatibility
+
+Install the published package with:
+
+```bash
+python -m pip install mlx-kfac
+```
+
+The supported release range is:
+
+- Python 3.10 through 3.14
+- MLX 0.25.2 through the 0.32 release series
+- Apple silicon with macOS 14 or newer
+
+The compatibility floor and current MLX release are separate CI targets, and
+the Python matrix runs against MLX 0.32. The package dependency is capped
+below MLX 0.33 because MLX is still pre-1.0; support for a new MLX minor is
+opened after its test matrix passes.
+
+MLX 0.32 officially requires native Python 3.10 or newer and macOS 14 or
+newer on Apple silicon. MLX also publishes Linux CPU/CUDA and Windows
+backends, but those backends are not yet release-qualified for mlx-kfac.
+See the [official MLX installation requirements][mlx-install] for the current
+upstream platform details.
+
+[mlx-install]: https://ml-explore.github.io/mlx/build/html/install.html
+
 ## Supported curvature blocks
 
 - Ordinary `mlx.nn.Linear`
@@ -48,6 +75,14 @@ mx.eval(model.parameters(), optimizer.state)
 `KFACLinear` remains available for compatibility, but ordinary `nn.Linear`
 instances are preferred.
 
+The installed package version is available without importing MLX:
+
+```python
+from importlib.metadata import version
+
+print(version("mlx-kfac"))
+```
+
 ## Curvature and stabilization options
 
 The optimizer maintains float32 EMA activation and output-gradient factors.
@@ -58,15 +93,30 @@ Available options include:
 
 - `damping_strategy="uniform"` or trace-based `"pi"`
 - `decomposition="cholesky"` or `"eigh"`
+- bounded adaptive damping through `min_damping` and `max_damping`
+- a relative eigenvalue floor for stable decompositions
 - preconditioned-gradient `momentum`
 - global `kl_clip`
 - adaptive damping through `adapt_damping(reduction_ratio)`
-- `max_factor_size` for two-dimensional block partitioning
+- `max_factor_size` for two-dimensional block partitioning (default: 1024)
 - `attention_head_blocks=True` for per-head projection factors
 
 Biases are included exactly once through a homogeneous activation coordinate.
 Embedding state stores `A_diag` with shape `[vocabulary]`, never a dense
 vocabulary-by-vocabulary matrix.
+
+Before allocating factors, KFAC estimates persistent optimizer array state
+(including float32 factors, decompositions, velocities, and fallback moments)
+and rejects projections above `max_state_size_bytes` (default: 2 GiB):
+
+```python
+projected_bytes = optimizer.estimate_state_size_bytes(model)
+optimizer.init(model.trainable_parameters(), model=model)
+assert optimizer.estimated_state_size_bytes == projected_bytes
+```
+
+Set either safety limit to `None` only when the resulting unpartitioned
+factors and optimizer state are known to fit in memory.
 
 `loss_reduction="sum"` (the default) treats captured cotangents as
 per-example/summed gradients. Use `"mean"` when the objective is averaged over
@@ -98,25 +148,31 @@ the already-aggregated parameter gradient also excludes padded positions.
 
 ## Compilation
 
-Initialize optimizer state, then capture both model and optimizer state:
+Initialize optimizer state, then capture both model and optimizer state. The
+recommended helper compiles separate static refresh and cached graphs, so
+decompositions are skipped between scheduled refreshes:
 
 ```python
 optimizer.init(model.trainable_parameters(), model=model)
 
-def step(x, y):
+def step(x, y, *, refresh):
     value, gradients = loss_and_grad(x, y)
-    optimizer.update(model, gradients)
+    optimizer.update(model, gradients, refresh=refresh)
     return value
 
 captured = [model.state, optimizer.state]
-step = mx.compile(step, inputs=captured, outputs=captured)
+step = optimizer.compile_step(step, inputs=captured, outputs=captured)
 ```
 
-MLX 0.32 has no lazy conditional primitive. The default compiled path computes
-a candidate decomposition and selects it at `inverse_update_interval`
-boundaries. To truly skip decomposition work in host-controlled or separately
-compiled paths, pass the static flag `refresh=False`; use `refresh=True` on
-scheduled refresh steps.
+The returned `CompiledKFACStep` owns the refresh schedule and selects between
+the two compiled graphs on the host. Each invocation is materialized inside a
+model/optimizer transaction so a decomposition or collective failure rolls
+back captured state before it is exposed to the next step. MLX 0.32 has no
+lazy conditional primitive, so a single directly compiled graph with a
+dynamic refresh predicate computes a candidate decomposition on every
+invocation. If graphs are compiled or controlled manually instead, pass
+static `refresh=False` on cached steps and `refresh=True` on scheduled refresh
+steps.
 
 Activation/output-cotangent capture must be consumed in the same differentiated
 step. Compile the whole training step as above; compiling `value_and_grad`
@@ -157,6 +213,13 @@ This produces the globally weighted gradient mean. A custom
 `factor_aggregator(numerator, count, kind, path)` can be used when collectives
 are managed externally.
 
+Distributed gradient schemas are coordinated before any rank-dependent
+collectives, including when `aggregate_distributed_gradients=False`. During
+compilation that validation must complete coherently while tracing; if the MLX
+backend cannot do so, pre-aggregate a fixed gradient tree and construct KFAC
+with `aggregate_distributed_gradients=False`. Factor statistics may still use
+`distributed_group`.
+
 ## Explicit limitations
 
 - Grouped/depthwise convolutions use AdamW fallback.
@@ -166,3 +229,28 @@ are managed externally.
   save model parameters and optimizer tree state instead.
 - Cholesky, eigendecomposition, and triangular solves use MLX's CPU stream on
   MLX 0.32; parameters and the rest of the graph may remain on the GPU.
+
+## Versioning and development
+
+mlx-kfac follows [Semantic Versioning](https://semver.org/). While the version
+is below 1.0, a minor release may change optimizer internals or checkpoint
+schemas. Public names exported from `mlx_kfac` are kept stable within a minor
+series, and checkpoint incompatibilities raise an explicit validation error.
+See the [changelog][project-changelog] for release-level compatibility notes.
+
+For a development checkout:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+Source distributions contain the complete test suite, including the
+two-process distributed workers; wheels contain only the importable package
+and license metadata. Maintainer release steps are documented in
+[RELEASING.md][release-guide].
+
+[project-changelog]: https://github.com/primateria/mlx-kfac/blob/main/CHANGELOG.md
+[release-guide]: https://github.com/primateria/mlx-kfac/blob/main/RELEASING.md

@@ -5,13 +5,13 @@ import subprocess
 import sys
 
 
-def test_two_rank_unequal_batch_factor_aggregation():
+def test_two_rank_conditional_validation_and_recovery():
     root = Path(__file__).resolve().parents[1]
     launcher = shutil.which("mlx.launch")
     if launcher is None:
         launcher = Path(sys.executable).with_name("mlx.launch")
     assert Path(launcher).is_file(), "mlx.launch is not installed"
-    worker = root / "tests" / "distributed_worker.py"
+    worker = root / "tests" / "distributed_safety_worker.py"
     environment = os.environ.copy()
     result = subprocess.run(
         [
@@ -33,4 +33,4 @@ def test_two_rank_unequal_batch_factor_aggregation():
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.count("distributed_kfac=ok") == 2
+    assert result.stdout.count("distributed_safety=ok") == 2

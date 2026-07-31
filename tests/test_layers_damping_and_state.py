@@ -644,6 +644,33 @@ class LayerDampingAndStateTests(unittest.TestCase):
             target.load_state(invalid, target_layer)
         self.assertIs(target.state, before)
 
+    def test_load_state_rejects_nonfinite_values_and_damping_outside_bounds(self):
+        source_layer = nn.Linear(2, 1)
+        source = KFAC(0.01, model=source_layer)
+        source.init(source_layer.trainable_parameters(), model=source_layer)
+        invalid_factor = tree_unflatten(list(tree_flatten(source.state)))
+        invalid_factor["layers"]["__root__"]["A"] = (
+            mx.ones_like(invalid_factor["layers"]["__root__"]["A"])
+            * float("inf")
+        )
+        invalid_damping = tree_unflatten(list(tree_flatten(source.state)))
+        invalid_damping["damping"] = mx.array(float("nan"), mx.float32)
+        out_of_bounds = tree_unflatten(list(tree_flatten(source.state)))
+        out_of_bounds["damping"] = mx.array(1e-9, mx.float32)
+
+        target_layer = nn.Linear(2, 1)
+        target = KFAC(0.01, model=target_layer, min_damping=1e-8)
+        before = target.state
+        for name, invalid, message in (
+            ("factor", invalid_factor, "non-finite"),
+            ("damping", invalid_damping, "non-finite"),
+            ("bounds", out_of_bounds, "bounds"),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    target.load_state(invalid, target_layer)
+                self.assertIs(target.state, before)
+
     def test_direct_state_assignment_validates_against_constructor_schema(self):
         source_layer = nn.Linear(2, 1)
         source = KFAC(0.01, model=source_layer)

@@ -18,6 +18,97 @@ from .capture import (
     instrument_model,
     is_instrumented,
 )
+from .memory import estimate_kfac_state_bytes
+from .runtime import (
+    _materialize_finite_arrays,
+    compile_kfac_step,
+    validate_state_memory_limit,
+)
+
+_FLOAT32_INFO = mx.finfo(mx.float32)
+_FLOAT32_MAX = float(_FLOAT32_INFO.max)
+_FLOAT32_MIN_SUBNORMAL = 2.0**-149
+# ``smallest_normal`` was added to MLX's ``finfo`` after the supported 0.25
+# floor. IEEE-754 float32 has a fixed minimum normal value, so keep the
+# constant as a compatibility fallback instead of raising the MLX floor.
+_FLOAT32_SMALLEST_NORMAL = float(
+    getattr(_FLOAT32_INFO, "smallest_normal", 2.0**-126)
+)
+_DEFAULT_RELATIVE_EIGENVALUE_FLOOR = 1e-6
+
+
+def _validate_float32_scalar(name, value):
+    """Return a finite scalar whose value is representable in float32."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a real scalar")
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(f"{name} must be a real scalar") from error
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite")
+    magnitude = abs(value)
+    if magnitude > _FLOAT32_MAX or (
+        magnitude != 0.0 and magnitude < _FLOAT32_MIN_SUBNORMAL
+    ):
+        raise ValueError(f"{name} must be representable in float32")
+    return value
+
+
+def _safe_eigenvalues(
+    values: mx.array,
+    relative_floor: Optional[float] = None,
+):
+    """Make eigenvalues finite and positive, with an optional relative floor."""
+    values = values.astype(mx.float32)
+    finite_values = mx.where(mx.isfinite(values), values, 0.0)
+    floor = mx.array(_FLOAT32_SMALLEST_NORMAL, mx.float32)
+    if relative_floor is not None:
+        scale = mx.maximum(mx.max(mx.abs(finite_values)), floor)
+        floor = mx.maximum(
+            scale * mx.array(relative_floor, mx.float32), floor
+        )
+    # Leave headroom for reconstruction and matrix-vector products.
+    ceiling = mx.array(_FLOAT32_MAX / 4.0, mx.float32)
+    return mx.minimum(mx.maximum(finite_values, floor), ceiling).astype(
+        mx.float32
+    )
+
+
+def _safe_psd_eigh(
+    matrix: mx.array,
+    relative_floor: float = _DEFAULT_RELATIVE_EIGENVALUE_FLOOR,
+):
+    """Compute a finite, scale-normalized eigendecomposition of a PSD matrix."""
+    matrix = matrix.astype(mx.float32)
+    matrix = mx.where(mx.isfinite(matrix), matrix, 0.0)
+    matrix = 0.5 * matrix + 0.5 * matrix.T
+    entry_scale = mx.maximum(
+        mx.max(mx.abs(matrix)),
+        mx.array(_FLOAT32_SMALLEST_NORMAL, mx.float32),
+    )
+    values, vectors = mx.linalg.eigh(matrix / entry_scale, stream=mx.cpu)
+    values = _safe_eigenvalues(values, relative_floor) * entry_scale
+    values = mx.minimum(
+        mx.where(mx.isfinite(values), values, _FLOAT32_MAX / 4.0),
+        mx.array(_FLOAT32_MAX / 4.0, mx.float32),
+    )
+    values = mx.maximum(
+        values, mx.array(_FLOAT32_SMALLEST_NORMAL, mx.float32)
+    )
+    return values.astype(mx.float32), vectors.astype(mx.float32)
+
+
+def _safe_cholesky_factor(cholesky: mx.array):
+    """Make a cached triangular factor finite with representable pivots."""
+    cholesky = cholesky.astype(mx.float32)
+    cholesky = mx.where(mx.isfinite(cholesky), cholesky, 0.0)
+    diagonal_floor = mx.array(
+        math.sqrt(_FLOAT32_SMALLEST_NORMAL), mx.float32
+    )
+    diagonal = mx.diag(cholesky)
+    safe_diagonal = mx.maximum(diagonal, diagonal_floor)
+    return cholesky + mx.diag(safe_diagonal - diagonal)
 
 
 class _Float32AdamW(optim.AdamW):
@@ -34,18 +125,30 @@ class _Float32AdamW(optim.AdamW):
         return updated.astype(parameter.dtype)
 
 
-def _cholesky(matrix: mx.array) -> mx.array:
+def _cholesky(
+    matrix: mx.array,
+    relative_floor: float = _DEFAULT_RELATIVE_EIGENVALUE_FLOOR,
+) -> mx.array:
+    """Build a Cholesky factor after robust PSD projection and flooring."""
+    values, vectors = _safe_psd_eigh(matrix, relative_floor)
+    stabilized = (vectors * values[None, :]) @ vectors.T
+    stabilized = 0.5 * stabilized + 0.5 * stabilized.T
+    stabilized = mx.where(mx.isfinite(stabilized), stabilized, 0.0)
     # MLX 0.32 currently implements these decompositions on its CPU stream.
-    return mx.linalg.cholesky(matrix, stream=mx.cpu).astype(mx.float32)
+    factor = mx.linalg.cholesky(stabilized, stream=mx.cpu).astype(mx.float32)
+    return _safe_cholesky_factor(factor)
 
 
-def _eigh(matrix: mx.array):
-    values, vectors = mx.linalg.eigh(matrix, stream=mx.cpu)
-    return values.astype(mx.float32), vectors.astype(mx.float32)
+def _eigh(
+    matrix: mx.array,
+    relative_floor: float = _DEFAULT_RELATIVE_EIGENVALUE_FLOOR,
+):
+    return _safe_psd_eigh(matrix, relative_floor)
 
 
 def _solve_cholesky(cholesky: mx.array, rhs: mx.array) -> mx.array:
     """Solve ``(L L.T) x = rhs`` from a cached lower Cholesky factor."""
+    cholesky = _safe_cholesky_factor(cholesky)
     y = mx.linalg.solve_triangular(cholesky, rhs, stream=mx.cpu)
     return mx.linalg.solve_triangular(
         cholesky.T, y, upper=True, stream=mx.cpu
@@ -67,11 +170,13 @@ def precondition_linear_gradient(
 
 
 def _solve_eigen(values: mx.array, vectors: mx.array, rhs: mx.array) -> mx.array:
+    values = _safe_eigenvalues(values)
     return vectors @ ((vectors.T @ rhs) / values[:, None])
 
 
 def _multiply_cholesky(cholesky: mx.array, rhs: mx.array) -> mx.array:
     """Multiply ``rhs`` by the matrix represented by a cached Cholesky."""
+    cholesky = _safe_cholesky_factor(cholesky)
     return cholesky @ (cholesky.T @ rhs)
 
 
@@ -79,6 +184,7 @@ def _multiply_eigen(
     values: mx.array, vectors: mx.array, rhs: mx.array
 ) -> mx.array:
     """Multiply ``rhs`` by the matrix represented by a cached eigendecomposition."""
+    values = _safe_eigenvalues(values)
     return vectors @ (values[:, None] * (vectors.T @ rhs))
 
 
@@ -209,15 +315,58 @@ class KFAC(optim.Optimizer):
         adaptive_damping: bool = False,
         damping_adaptation_interval: int = 5,
         damping_adaptation_decay: float = 0.9,
+        min_damping: float = 1e-8,
+        max_damping: float = 1e8,
+        decomposition_relative_eigenvalue_floor: float = 1e-6,
         include_embeddings: bool = True,
-        max_factor_size: Optional[int] = None,
+        max_factor_size: Optional[int] = 1024,
+        max_state_size_bytes: Optional[int] = 2 * 1024**3,
         attention_head_blocks: bool = False,
     ):
+        if not callable(learning_rate):
+            learning_rate = _validate_float32_scalar(
+                "learning_rate", learning_rate
+            )
+        damping = _validate_float32_scalar("damping", damping)
+        factor_decay = _validate_float32_scalar(
+            "factor_decay", factor_decay
+        )
+        momentum = _validate_float32_scalar("momentum", momentum)
+        if kl_clip is not None:
+            kl_clip = _validate_float32_scalar("kl_clip", kl_clip)
+        weight_decay = _validate_float32_scalar("weight_decay", weight_decay)
+        fallback_betas = tuple(
+            _validate_float32_scalar(f"fallback_betas[{index}]", beta)
+            for index, beta in enumerate(fallback_betas)
+        )
+        fallback_eps = _validate_float32_scalar(
+            "fallback_eps", fallback_eps
+        )
+        output_gradient_scale = _validate_float32_scalar(
+            "output_gradient_scale", output_gradient_scale
+        )
+        damping_adaptation_decay = _validate_float32_scalar(
+            "damping_adaptation_decay", damping_adaptation_decay
+        )
+        min_damping = _validate_float32_scalar(
+            "min_damping", min_damping
+        )
+        max_damping = _validate_float32_scalar(
+            "max_damping", max_damping
+        )
+        decomposition_relative_eigenvalue_floor = _validate_float32_scalar(
+            "decomposition_relative_eigenvalue_floor",
+            decomposition_relative_eigenvalue_floor,
+        )
         if damping <= 0:
             raise ValueError("damping must be positive")
         if not 0 <= factor_decay < 1:
             raise ValueError("factor_decay must be in [0, 1)")
-        if inverse_update_interval < 1:
+        if (
+            isinstance(inverse_update_interval, bool)
+            or not isinstance(inverse_update_interval, int)
+            or inverse_update_interval < 1
+        ):
             raise ValueError("inverse_update_interval must be at least 1")
         if not 0 <= momentum < 1:
             raise ValueError("momentum must be in [0, 1)")
@@ -231,6 +380,12 @@ class KFAC(optim.Optimizer):
             raise ValueError("decomposition must be 'cholesky' or 'eigh'")
         if output_gradient_scale <= 0:
             raise ValueError("output_gradient_scale must be positive")
+        if fallback_eps <= 0:
+            raise ValueError("fallback_eps must be positive")
+        if any(not 0 <= beta < 1 for beta in fallback_betas):
+            raise ValueError("fallback_betas must be in [0, 1)")
+        if len(fallback_betas) != 2:
+            raise ValueError("fallback_betas must contain two values")
         if loss_reduction not in {"sum", "mean"}:
             raise ValueError("loss_reduction must be 'sum' or 'mean'")
         if max_factor_size is not None and (
@@ -239,10 +394,31 @@ class KFAC(optim.Optimizer):
             or max_factor_size < 1
         ):
             raise ValueError("max_factor_size must be a positive integer")
-        if damping_adaptation_interval < 1:
+        if max_state_size_bytes is not None and (
+            isinstance(max_state_size_bytes, bool)
+            or not isinstance(max_state_size_bytes, int)
+            or max_state_size_bytes < 1
+        ):
+            raise ValueError(
+                "max_state_size_bytes must be a positive integer or None"
+            )
+        if (
+            isinstance(damping_adaptation_interval, bool)
+            or not isinstance(damping_adaptation_interval, int)
+            or damping_adaptation_interval < 1
+        ):
             raise ValueError("damping_adaptation_interval must be positive")
         if not 0 < damping_adaptation_decay < 1:
             raise ValueError("damping_adaptation_decay must be in (0, 1)")
+        if not 0 < min_damping <= damping <= max_damping:
+            raise ValueError(
+                "damping bounds must satisfy "
+                "0 < min_damping <= damping <= max_damping"
+            )
+        if not 0 < decomposition_relative_eigenvalue_floor <= 1:
+            raise ValueError(
+                "decomposition_relative_eigenvalue_floor must be in (0, 1]"
+            )
 
         super().__init__()
         self._maybe_schedule("learning_rate", learning_rate)
@@ -272,8 +448,15 @@ class KFAC(optim.Optimizer):
         self.adaptive_damping = adaptive_damping
         self.damping_adaptation_interval = damping_adaptation_interval
         self.damping_adaptation_decay = damping_adaptation_decay
+        self.min_damping = min_damping
+        self.max_damping = max_damping
+        self.decomposition_relative_eigenvalue_floor = (
+            decomposition_relative_eigenvalue_floor
+        )
         self.include_embeddings = include_embeddings
         self.max_factor_size = max_factor_size
+        self.max_state_size_bytes = max_state_size_bytes
+        self._estimated_state_size_bytes = 0
         self.attention_head_blocks = attention_head_blocks
         self._partition_overrides = {}
         self._fallback = _Float32AdamW(
@@ -312,6 +495,14 @@ class KFAC(optim.Optimizer):
         self._state_assigned = False
         if model is not None:
             self.register(model)
+
+    def _factor_cholesky(self, matrix):
+        return _cholesky(
+            matrix, self.decomposition_relative_eigenvalue_floor
+        )
+
+    def _factor_eigh(self, matrix):
+        return _eigh(matrix, self.decomposition_relative_eigenvalue_floor)
 
     def register(self, model: nn.Module):
         """Instrument supported modules before forward/backward."""
@@ -363,6 +554,35 @@ class KFAC(optim.Optimizer):
             )
         self._model = model
         return model
+
+    def estimate_state_size_bytes(self, model=None, parameters=None) -> int:
+        """Estimate persistent float32 optimizer state for a model."""
+        model = model or self._model
+        if model is None:
+            raise ValueError("A model is required for K-FAC memory estimation")
+        return estimate_kfac_state_bytes(self, model, parameters)
+
+    @property
+    def estimated_state_size_bytes(self) -> int:
+        """Most recent pre-allocation optimizer-state estimate."""
+        return self._estimated_state_size_bytes
+
+    def compile_step(
+        self,
+        step,
+        *,
+        inputs=None,
+        outputs=None,
+        shapeless=False,
+    ):
+        """Compile static refresh/cached graphs and return a host dispatcher."""
+        return compile_kfac_step(
+            self,
+            step,
+            inputs=inputs,
+            outputs=outputs,
+            shapeless=shapeless,
+        )
 
     def init_single(self, parameter: mx.array, state: dict):
         # Initialization is model-aware and implemented below.
@@ -435,11 +655,15 @@ class KFAC(optim.Optimizer):
             "cached_curvature_scale": mx.array(1.0, dtype=mx.float32),
         }
         if self.decomposition == "cholesky":
-            state["A_cholesky"] = _cholesky(a_damped)
-            state["G_cholesky"] = _cholesky(g_damped)
+            state["A_cholesky"] = self._factor_cholesky(a_damped)
+            state["G_cholesky"] = self._factor_cholesky(g_damped)
         else:
-            state["A_eigenvalues"], state["A_eigenvectors"] = _eigh(a_damped)
-            state["G_eigenvalues"], state["G_eigenvectors"] = _eigh(g_damped)
+            state["A_eigenvalues"], state["A_eigenvectors"] = (
+                self._factor_eigh(a_damped)
+            )
+            state["G_eigenvalues"], state["G_eigenvectors"] = (
+                self._factor_eigh(g_damped)
+            )
         if self.damping_strategy == "pi" and (
             in_dims == 1 or out_dims == 1
         ):
@@ -452,12 +676,12 @@ class KFAC(optim.Optimizer):
                     in_dims, dtype=mx.float32
                 )
             if self.decomposition == "cholesky":
-                state["combined_cholesky"] = _cholesky(combined)
+                state["combined_cholesky"] = self._factor_cholesky(combined)
             else:
                 (
                     state["combined_eigenvalues"],
                     state["combined_eigenvectors"],
-                ) = _eigh(combined)
+                ) = self._factor_eigh(combined)
         return state
 
     def _partition_sizes(self, path, out_dims, in_dims):
@@ -502,20 +726,28 @@ class KFAC(optim.Optimizer):
         state["damping_G"] = damping.astype(mx.float32)
         if self.decomposition == "cholesky":
             state["A_cholesky_blocks"] = [
-                _cholesky(block + damping * mx.eye(block.shape[0]))
+                self._factor_cholesky(
+                    block + damping * mx.eye(block.shape[0])
+                )
                 for block in a_blocks
             ]
             state["G_cholesky_blocks"] = [
-                _cholesky(block + damping * mx.eye(block.shape[0]))
+                self._factor_cholesky(
+                    block + damping * mx.eye(block.shape[0])
+                )
                 for block in g_blocks
             ]
         else:
             a_decompositions = [
-                _eigh(block + damping * mx.eye(block.shape[0]))
+                self._factor_eigh(
+                    block + damping * mx.eye(block.shape[0])
+                )
                 for block in a_blocks
             ]
             g_decompositions = [
-                _eigh(block + damping * mx.eye(block.shape[0]))
+                self._factor_eigh(
+                    block + damping * mx.eye(block.shape[0])
+                )
                 for block in g_blocks
             ]
             state["A_eigenvalue_blocks"] = [item[0] for item in a_decompositions]
@@ -543,10 +775,12 @@ class KFAC(optim.Optimizer):
                 ]
             if self.decomposition == "cholesky":
                 state["combined_cholesky_blocks"] = [
-                    _cholesky(block) for block in combined
+                    self._factor_cholesky(block) for block in combined
                 ]
             else:
-                decompositions = [_eigh(block) for block in combined]
+                decompositions = [
+                    self._factor_eigh(block) for block in combined
+                ]
                 state["combined_eigenvalue_blocks"] = [
                     item[0] for item in decompositions
                 ]
@@ -574,9 +808,11 @@ class KFAC(optim.Optimizer):
             state["G"] = g
             g_damped = g + damping_g * mx.eye(dims, dtype=mx.float32)
             if self.decomposition == "cholesky":
-                state["G_cholesky"] = _cholesky(g_damped)
+                state["G_cholesky"] = self._factor_cholesky(g_damped)
             else:
-                state["G_eigenvalues"], state["G_eigenvectors"] = _eigh(g_damped)
+                state["G_eigenvalues"], state["G_eigenvectors"] = (
+                    self._factor_eigh(g_damped)
+                )
         else:
             state["G_blocks"] = g_blocks
             damped = [
@@ -585,10 +821,12 @@ class KFAC(optim.Optimizer):
             ]
             if self.decomposition == "cholesky":
                 state["G_cholesky_blocks"] = [
-                    _cholesky(block) for block in damped
+                    self._factor_cholesky(block) for block in damped
                 ]
             else:
-                decompositions = [_eigh(block) for block in damped]
+                decompositions = [
+                    self._factor_eigh(block) for block in damped
+                ]
                 state["G_eigenvalue_blocks"] = [
                     item[0] for item in decompositions
                 ]
@@ -609,10 +847,12 @@ class KFAC(optim.Optimizer):
                 ]
                 if self.decomposition == "cholesky":
                     state["combined_cholesky_blocks"] = [
-                        _cholesky(block) for block in combined
+                        self._factor_cholesky(block) for block in combined
                     ]
                 else:
-                    decompositions = [_eigh(block) for block in combined]
+                    decompositions = [
+                        self._factor_eigh(block) for block in combined
+                    ]
                     state["combined_eigenvalue_blocks"] = [
                         item[0] for item in decompositions
                     ]
@@ -648,6 +888,13 @@ class KFAC(optim.Optimizer):
             self._state_assigned = False
             return
         self._model = model
+        estimated_bytes = self.estimate_state_size_bytes(
+            model=model, parameters=parameters
+        )
+        self._estimated_state_size_bytes = estimated_bytes
+        validate_state_memory_limit(
+            estimated_bytes, self.max_state_size_bytes
+        )
         layers = self._find_layers(model)
         flat_params = dict(tree_flatten(parameters))
         supported = set()
@@ -697,6 +944,11 @@ class KFAC(optim.Optimizer):
     def load_state(self, state, model: nn.Module):
         """Restore optimizer state and validate it against ``model``."""
         self.register(model)
+        estimated_bytes = self.estimate_state_size_bytes(model=model)
+        self._estimated_state_size_bytes = estimated_bytes
+        validate_state_memory_limit(
+            estimated_bytes, self.max_state_size_bytes
+        )
         # Copy Python containers so two live optimizers cannot mutate each
         # other's state dictionaries. MLX arrays are immutable and may safely
         # be shared until replaced by the next functional update.
@@ -837,6 +1089,25 @@ class KFAC(optim.Optimizer):
                     raise ValueError(
                         f"Incompatible AdamW fallback state for '{path}'"
                     )
+        finite_checks = [
+            (path, mx.all(mx.isfinite(leaf)))
+            for path, leaf in tree_flatten(state)
+        ]
+        mx.eval([check for _, check in finite_checks])
+        nonfinite = [
+            path for path, check in finite_checks if not bool(check)
+        ]
+        if nonfinite:
+            raise ValueError(
+                "Checkpoint optimizer state contains non-finite values at "
+                + ", ".join(nonfinite)
+            )
+        restored_damping = float(state["damping"])
+        if not self.min_damping <= restored_damping <= self.max_damping:
+            raise ValueError(
+                "Checkpoint damping must satisfy configured bounds "
+                f"[{self.min_damping}, {self.max_damping}]"
+            )
         self.state = state
         self._initialized = True
         self._state_assigned = False
@@ -854,15 +1125,28 @@ class KFAC(optim.Optimizer):
         ) == 0
         ratio = mx.array(reduction_ratio, mx.float32)
         decay = self.damping_adaptation_decay
-        lower = self.state["damping"] / decay
-        upper = self.state["damping"] * decay
+        minimum = mx.array(self.min_damping, mx.float32)
+        maximum = mx.array(self.max_damping, mx.float32)
+        current = mx.where(
+            mx.isfinite(self.state["damping"]),
+            self.state["damping"],
+            mx.array(self.damping, mx.float32),
+        )
+        current = mx.clip(current, minimum, maximum)
+        lower = current / decay
+        upper = current * decay
         proposed = mx.where(
             ratio < 0.25,
             lower,
-            mx.where(ratio > 0.75, upper, self.state["damping"]),
+            mx.where(ratio > 0.75, upper, current),
+        )
+        proposed = mx.clip(
+            mx.where(mx.isfinite(proposed), proposed, maximum),
+            minimum,
+            maximum,
         )
         self.state["damping"] = mx.where(
-            due, proposed, self.state["damping"]
+            due, proposed, current
         ).astype(mx.float32)
         self.state["force_refresh"] = mx.logical_or(
             self.state["force_refresh"], due
@@ -870,30 +1154,120 @@ class KFAC(optim.Optimizer):
         return self.state["damping"]
 
     def _aggregate_stats(self, numerator, count, kind, path):
+        callback_error = None
         if self.factor_aggregator is not None:
-            if self._factor_aggregator_uses_stats:
-                numerator, count = self.factor_aggregator(
-                    numerator, count, kind, path
+            original_numerator = numerator
+            original_count = count
+            try:
+                if self._factor_aggregator_uses_stats:
+                    numerator, count = self.factor_aggregator(
+                        numerator, count, kind, path
+                    )
+                else:
+                    factor = numerator / mx.maximum(
+                        count, mx.array(1.0, mx.float32)
+                    )
+                    factor = self.factor_aggregator(factor, kind, path)
+                    numerator = factor.astype(mx.float32) * count
+                if numerator.shape != original_numerator.shape or count.size != 1:
+                    raise ValueError(
+                        "factor_aggregator must preserve numerator shape "
+                        "and return a scalar count"
+                    )
+            except Exception as error:
+                callback_error = error
+                numerator = mx.zeros_like(original_numerator)
+                count = mx.zeros_like(original_count)
+
+        distributed = (
+            self.distributed_group is not None
+            and self.distributed_group.size() > 1
+        )
+        if callback_error is not None and not distributed:
+            raise callback_error
+        if distributed:
+            if self.factor_aggregator is not None:
+                error_count = mx.distributed.all_sum(
+                    mx.array(callback_error is not None, mx.uint32),
+                    group=self.distributed_group,
                 )
-            else:
-                factor = numerator / mx.maximum(
-                    count, mx.array(1.0, mx.float32)
-                )
-                factor = self.factor_aggregator(factor, kind, path)
-                numerator = factor.astype(mx.float32) * count
-        if self.distributed_group is not None:
-            size = self.distributed_group.size()
-            if size > 1:
-                numerator = mx.distributed.all_sum(
-                    numerator, group=self.distributed_group
-                )
-                count = mx.distributed.all_sum(
-                    count, group=self.distributed_group
-                )
+                # This is an eager coordination barrier. A Python callback
+                # cannot fail dynamically inside an already compiled graph.
+                if int(error_count) > 0:
+                    if callback_error is not None:
+                        raise callback_error
+                    raise RuntimeError(
+                        "factor_aggregator failed on another distributed rank"
+                    )
+            numerator = mx.distributed.all_sum(
+                numerator, group=self.distributed_group
+            )
+            count = mx.distributed.all_sum(
+                count, group=self.distributed_group
+            )
         factor = (
             numerator / mx.maximum(count, mx.array(1.0, mx.float32))
         ).astype(mx.float32)
         return factor, count.astype(mx.float32)
+
+    def _empty_observed_factors(self, path, state):
+        """Contribute zero local statistics while preserving collective order."""
+        zero_count = mx.array(0.0, mx.float32)
+        if "A_diag" in state:
+            batch_a, a_count = self._aggregate_stats(
+                mx.zeros_like(state["A_diag"]),
+                zero_count,
+                "A_diag",
+                path,
+            )
+            if "G_blocks" in state:
+                batch_g = []
+                for index, block in enumerate(state["G_blocks"]):
+                    factor, _ = self._aggregate_stats(
+                        mx.zeros_like(block),
+                        zero_count,
+                        f"G.{index}",
+                        path,
+                    )
+                    batch_g.append(factor)
+            else:
+                batch_g, _ = self._aggregate_stats(
+                    mx.zeros_like(state["G"]), zero_count, "G", path
+                )
+        elif "A_blocks" in state:
+            batch_a = []
+            for index, block in enumerate(state["A_blocks"]):
+                factor, a_count = self._aggregate_stats(
+                    mx.zeros_like(block),
+                    zero_count,
+                    f"A.{index}",
+                    path,
+                )
+                batch_a.append(factor)
+            batch_g = []
+            for index, block in enumerate(state["G_blocks"]):
+                factor, _ = self._aggregate_stats(
+                    mx.zeros_like(block),
+                    zero_count,
+                    f"G.{index}",
+                    path,
+                )
+                batch_g.append(factor)
+        else:
+            batch_a, a_count = self._aggregate_stats(
+                mx.zeros_like(state["A"]), zero_count, "A", path
+            )
+            batch_g, _ = self._aggregate_stats(
+                mx.zeros_like(state["G"]), zero_count, "G", path
+            )
+
+        batch_count = mx.distributed.all_sum(
+            zero_count, group=self.distributed_group
+        )
+        curvature_scale = a_count / mx.maximum(
+            batch_count, mx.array(1.0, mx.float32)
+        )
+        return batch_a, batch_g, a_count, curvature_scale
 
     def _observed_factors(self, path, layer, state, mask=None):
         if _layer_kind(layer) == "embedding":
@@ -1083,7 +1457,9 @@ class KFAC(optim.Optimizer):
     ):
         """Refresh an exact scalar-factor block decomposition."""
         if "combined_cholesky_blocks" in state:
-            new_blocks = [_cholesky(matrix) for matrix in matrices]
+            new_blocks = [
+                self._factor_cholesky(matrix) for matrix in matrices
+            ]
             state["combined_cholesky_blocks"] = (
                 new_blocks
                 if refresh is True
@@ -1095,7 +1471,7 @@ class KFAC(optim.Optimizer):
                 ]
             )
             return
-        new_blocks = [_eigh(matrix) for matrix in matrices]
+        new_blocks = [self._factor_eigh(matrix) for matrix in matrices]
         new_values = [item[0] for item in new_blocks]
         new_vectors = [item[1] for item in new_blocks]
         if refresh is True:
@@ -1204,7 +1580,9 @@ class KFAC(optim.Optimizer):
                     for block in state["G_blocks"]
                 ]
                 if self.decomposition == "cholesky":
-                    new_g = [_cholesky(block) for block in damped]
+                    new_g = [
+                        self._factor_cholesky(block) for block in damped
+                    ]
                     state["G_cholesky_blocks"] = (
                         new_g
                         if refresh is True
@@ -1216,7 +1594,9 @@ class KFAC(optim.Optimizer):
                         ]
                     )
                 else:
-                    decompositions = [_eigh(block) for block in damped]
+                    decompositions = [
+                        self._factor_eigh(block) for block in damped
+                    ]
                     new_gv = [item[0] for item in decompositions]
                     new_gq = [item[1] for item in decompositions]
                     if refresh is True:
@@ -1241,14 +1621,14 @@ class KFAC(optim.Optimizer):
                 state["G"].shape[0], dtype=mx.float32
             )
             if self.decomposition == "cholesky":
-                new_g = _cholesky(g_damped)
+                new_g = self._factor_cholesky(g_damped)
                 state["G_cholesky"] = (
                     new_g
                     if refresh is True
                     else mx.where(refresh, new_g, state["G_cholesky"])
                 )
             else:
-                new_gv, new_gq = _eigh(g_damped)
+                new_gv, new_gq = self._factor_eigh(g_damped)
                 if refresh is True:
                     state["G_eigenvalues"] = new_gv
                     state["G_eigenvectors"] = new_gq
@@ -1306,8 +1686,12 @@ class KFAC(optim.Optimizer):
                 for block in state["G_blocks"]
             ]
             if self.decomposition == "cholesky":
-                new_a = [_cholesky(block) for block in a_damped]
-                new_g = [_cholesky(block) for block in g_damped]
+                new_a = [
+                    self._factor_cholesky(block) for block in a_damped
+                ]
+                new_g = [
+                    self._factor_cholesky(block) for block in g_damped
+                ]
                 if refresh is True:
                     state["A_cholesky_blocks"] = new_a
                     state["G_cholesky_blocks"] = new_g
@@ -1321,8 +1705,8 @@ class KFAC(optim.Optimizer):
                         for new, old in zip(new_g, state["G_cholesky_blocks"])
                     ]
             else:
-                new_a = [_eigh(block) for block in a_damped]
-                new_g = [_eigh(block) for block in g_damped]
+                new_a = [self._factor_eigh(block) for block in a_damped]
+                new_g = [self._factor_eigh(block) for block in g_damped]
                 new_av, new_aq = zip(*new_a)
                 new_gv, new_gq = zip(*new_g)
                 if refresh is True:
@@ -1359,8 +1743,8 @@ class KFAC(optim.Optimizer):
             state["G"].shape[0], dtype=mx.float32
         )
         if self.decomposition == "cholesky":
-            new_a = _cholesky(a_damped)
-            new_g = _cholesky(g_damped)
+            new_a = self._factor_cholesky(a_damped)
+            new_g = self._factor_cholesky(g_damped)
             if refresh is True:
                 state["A_cholesky"] = new_a
                 state["G_cholesky"] = new_g
@@ -1372,8 +1756,8 @@ class KFAC(optim.Optimizer):
                     refresh, new_g, state["G_cholesky"]
                 ).astype(mx.float32)
         else:
-            new_av, new_aq = _eigh(a_damped)
-            new_gv, new_gq = _eigh(g_damped)
+            new_av, new_aq = self._factor_eigh(a_damped)
+            new_gv, new_gq = self._factor_eigh(g_damped)
             if refresh is True:
                 state["A_eigenvalues"], state["A_eigenvectors"] = new_av, new_aq
                 state["G_eigenvalues"], state["G_eigenvectors"] = new_gv, new_gq
@@ -1404,12 +1788,12 @@ class KFAC(optim.Optimizer):
                     * mx.eye(state["A"].shape[0], dtype=mx.float32)
                 )
             if self.decomposition == "cholesky":
-                new_combined = _cholesky(combined)
+                new_combined = self._factor_cholesky(combined)
                 state["combined_cholesky"] = _select_refresh(
                     refresh, new_combined, state["combined_cholesky"]
                 )
             else:
-                new_values, new_vectors = _eigh(combined)
+                new_values, new_vectors = self._factor_eigh(combined)
                 state["combined_eigenvalues"] = _select_refresh(
                     refresh, new_values, state["combined_eigenvalues"]
                 )
@@ -1785,8 +2169,8 @@ class KFAC(optim.Optimizer):
         refresh=None,
         gradient_weight=None,
     ):
-        model.update(
-            self.apply_gradients(
+        def operation():
+            updates = self._apply_gradients_impl(
                 gradients,
                 model,
                 model=model,
@@ -1794,9 +2178,214 @@ class KFAC(optim.Optimizer):
                 refresh=refresh,
                 gradient_weight=gradient_weight,
             )
-        )
+            model.update(updates)
+
+        return self._run_update_transaction(model, operation)
 
     def apply_gradients(
+        self,
+        gradients: dict,
+        parameters: dict,
+        *,
+        model=None,
+        masks=None,
+        refresh=None,
+        gradient_weight=None,
+    ):
+        resolved_model = model or (
+            parameters if isinstance(parameters, nn.Module) else None
+        )
+        resolved_model = resolved_model or self._model
+        if resolved_model is None:
+            raise ValueError("KFAC requires a model")
+
+        return self._run_update_transaction(
+            resolved_model,
+            lambda: self._apply_gradients_impl(
+                gradients,
+                parameters,
+                model=resolved_model,
+                masks=masks,
+                refresh=refresh,
+                gradient_weight=gradient_weight,
+            ),
+        )
+
+    @staticmethod
+    def _clone_state_containers(value):
+        """Copy tree containers while sharing immutable MLX array leaves."""
+        if isinstance(value, dict):
+            return {
+                key: KFAC._clone_state_containers(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [KFAC._clone_state_containers(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(KFAC._clone_state_containers(item) for item in value)
+        return value
+
+    def _run_update_transaction(self, model, operation):
+        previous_state_reference = self._state
+        previous_state = self._clone_state_containers(self._state)
+        previous_fallback = self._clone_state_containers(
+            self._fallback.state
+        )
+        previous_model_state = self._clone_state_containers(model.state)
+        previous_initialized = self._initialized
+        previous_state_assigned = self._state_assigned
+        previous_fallback_initialized = getattr(
+            self._fallback, "_initialized", False
+        )
+        previous_model = self._model
+        previous_partition_overrides = self._clone_state_containers(
+            self._partition_overrides
+        )
+        try:
+            return operation()
+        except BaseException:
+            # Bypass a user override that may itself have caused a partial
+            # ``model.update`` failure.
+            nn.Module.update(model, previous_model_state)
+            if isinstance(previous_state, dict) and "fallback" in previous_state:
+                previous_state["fallback"] = previous_fallback
+            if isinstance(previous_state_reference, dict) and isinstance(
+                previous_state, dict
+            ):
+                previous_state_reference.clear()
+                previous_state_reference.update(previous_state)
+                self._state = previous_state_reference
+            else:
+                self._state = previous_state_reference
+            self._fallback.state = previous_fallback
+            self._initialized = previous_initialized
+            self._state_assigned = previous_state_assigned
+            self._fallback._initialized = previous_fallback_initialized
+            self._model = previous_model
+            self._partition_overrides = previous_partition_overrides
+            raise
+        finally:
+            clear_observations(model)
+
+    @staticmethod
+    def _gradient_schema_fingerprint(flat_gradients):
+        value = 0
+        for path, gradient in sorted(flat_gradients.items()):
+            description = f"{path}:{gradient.shape}:{gradient.dtype}"
+            for byte in description.encode():
+                value = (value * 257 + byte) % 1_000_003
+        return value
+
+    def _aggregate_distributed_gradients(
+        self, flat_gradients, gradient_weight
+    ):
+        group = self.distributed_group
+        size = group.size()
+
+        conversion_error = False
+        if gradient_weight is None:
+            local_mode = 0
+            local_weight = mx.array(1.0, mx.float32)
+        else:
+            local_mode = 1
+            try:
+                candidate = mx.array(gradient_weight, mx.float32)
+                if candidate.size != 1:
+                    raise ValueError("gradient_weight must be a scalar")
+                local_weight = candidate.reshape(())
+            except (TypeError, ValueError):
+                conversion_error = True
+                local_weight = mx.array(0.0, mx.float32)
+
+        local_invalid = mx.logical_or(
+            mx.array(conversion_error),
+            mx.logical_or(
+                mx.logical_not(mx.isfinite(local_weight)),
+                local_weight < 0,
+            ),
+        )
+        mode_count = mx.distributed.all_sum(
+            mx.array(local_mode, mx.uint32), group=group
+        )
+        invalid_count = mx.distributed.all_sum(
+            local_invalid.astype(mx.uint32), group=group
+        )
+        safe_local_weight = mx.where(
+            local_invalid, mx.array(0.0, mx.float32), local_weight
+        )
+        global_weight = mx.distributed.all_sum(
+            safe_local_weight, group=group
+        )
+
+        try:
+            mode_value = int(mode_count)
+            invalid_value = int(invalid_count)
+            weight_value = float(global_weight)
+        except (RuntimeError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                "Unable to coordinate distributed gradient weights while "
+                "tracing. Pre-aggregate a fixed gradient tree and set "
+                "aggregate_distributed_gradients=False for mx.compile."
+            ) from error
+        else:
+            if mode_value not in {0, size}:
+                raise ValueError(
+                    "gradient_weight must be provided on every rank or none"
+                )
+            if invalid_value:
+                raise ValueError(
+                    "gradient_weight must be finite and non-negative"
+                )
+            if not math.isfinite(weight_value) or weight_value <= 0:
+                raise ValueError(
+                    "The global gradient_weight must be positive and finite"
+                )
+            effective_weight = safe_local_weight
+            denominator = global_weight
+
+        return {
+            path: (
+                mx.distributed.all_sum(
+                    gradient.astype(mx.float32) * effective_weight,
+                    group=group,
+                )
+                / denominator
+            )
+            for path, gradient in sorted(flat_gradients.items())
+        }
+
+    def _validate_distributed_gradient_schema(self, flat_gradients):
+        """Coordinate a fixed schema before any rank-dependent collectives."""
+        group = self.distributed_group
+        size = group.size()
+        local_count = len(flat_gradients)
+        local_fingerprint = self._gradient_schema_fingerprint(flat_gradients)
+        global_count = mx.distributed.all_sum(
+            mx.array(local_count, mx.uint32), group=group
+        )
+        global_fingerprint = mx.distributed.all_sum(
+            mx.array(local_fingerprint, mx.uint32), group=group
+        )
+        local_schema_mismatch = mx.logical_or(
+            global_count != local_count * size,
+            global_fingerprint != local_fingerprint * size,
+        )
+        mismatch_count = mx.distributed.all_sum(
+            local_schema_mismatch.astype(mx.uint32), group=group
+        )
+        try:
+            mismatch_value = int(mismatch_count)
+        except (RuntimeError, TypeError, ValueError) as error:
+            # Do not proceed to per-gradient or per-layer collectives unless
+            # every rank has coherently validated the static gradient tree.
+            raise RuntimeError(
+                "Unable to validate distributed gradient schemas while "
+                "tracing. Compile with a fixed pre-aggregated gradient tree."
+            ) from error
+        if mismatch_value:
+            raise ValueError("Distributed gradient trees differ across ranks")
+
+    def _apply_gradients_impl(
         self,
         gradients: dict,
         parameters: dict,
@@ -1828,38 +2417,16 @@ class KFAC(optim.Optimizer):
 
         layers = self._find_layers(model)
         flat_grads = dict(tree_flatten(gradients))
-        if (
+        distributed = (
             self.distributed_group is not None
             and self.distributed_group.size() > 1
-            and self.aggregate_distributed_gradients
-        ):
-            if gradient_weight is None:
-                denominator = mx.array(
-                    self.distributed_group.size(), mx.float32
+        )
+        if distributed:
+            self._validate_distributed_gradient_schema(flat_grads)
+            if self.aggregate_distributed_gradients:
+                flat_grads = self._aggregate_distributed_gradients(
+                    flat_grads, gradient_weight
                 )
-                flat_grads = {
-                    path: mx.distributed.all_sum(
-                        gradient.astype(mx.float32),
-                        group=self.distributed_group,
-                    )
-                    / denominator
-                    for path, gradient in flat_grads.items()
-                }
-            else:
-                local_weight = mx.array(gradient_weight, mx.float32)
-                global_weight = mx.distributed.all_sum(
-                    local_weight, group=self.distributed_group
-                )
-                flat_grads = {
-                    path: (
-                        mx.distributed.all_sum(
-                            gradient.astype(mx.float32) * local_weight,
-                            group=self.distributed_group,
-                        )
-                        / global_weight
-                    )
-                    for path, gradient in flat_grads.items()
-                }
         flat_params = dict(tree_flatten(parameters))
         supported = set()
         candidates = {}
@@ -1901,17 +2468,30 @@ class KFAC(optim.Optimizer):
                     path, layer, state, masks.get(path)
                 )
             except MissingObservationError:
-                # Ownership is static: a conditional supported layer with no
-                # observation is skipped for this step, never reassigned to
-                # AdamW (whose state tree has a different fixed structure).
-                # Its factors are unchanged, but a scheduled or damping-forced
-                # refresh must still update the cached decomposition.
-                self._refresh_decomposition(state, refresh)
-                supported.add(weight_path)
-                bias_path = prefix + "bias"
-                if bias_path in flat_grads:
-                    supported.add(bias_path)
-                continue
+                if (
+                    self.distributed_group is not None
+                    and self.distributed_group.size() > 1
+                ):
+                    # Every rank must execute the same factor collectives.
+                    # A rank on which this conditional layer was inactive
+                    # contributes zero local numerators and counts.
+                    (
+                        batch_a,
+                        batch_g,
+                        sample_count,
+                        curvature_scale,
+                    ) = self._empty_observed_factors(path, state)
+                else:
+                    # Ownership is static: a conditional supported layer with
+                    # no observation is skipped rather than reassigned to
+                    # AdamW. A requested refresh still updates its cached
+                    # decomposition (for example after damping adaptation).
+                    self._refresh_decomposition(state, refresh)
+                    supported.add(weight_path)
+                    bias_path = prefix + "bias"
+                    if bias_path in flat_grads:
+                        supported.add(bias_path)
+                    continue
             decay = self.factor_decay
             has_samples = sample_count > 0
             old_scale = state["curvature_scale"]
@@ -2088,5 +2668,18 @@ class KFAC(optim.Optimizer):
         self._fallback.state["step"] = self.step
         self._state["fallback"] = self._fallback.state
 
-        clear_observations(model)
-        return tree_unflatten(list(updates.items()))
+        updates = tree_unflatten(list(updates.items()))
+        try:
+            # In eager mode, materialize all state and parameter updates before
+            # committing the transaction so lazy decomposition/collective
+            # failures are caught by the rollback path. Tracers cannot be
+            # converted to int, so compiled graphs retain normal lazy capture.
+            int(self.step)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+        else:
+            _materialize_finite_arrays(
+                updates=updates,
+                optimizer_state=self.state,
+            )
+        return updates

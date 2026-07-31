@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }} / MLX ${{ matrix.mlx }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            python: "3.10"
+            mlx: "0.32.0"
+          - os: macos-15
+            python: "3.11"
+            mlx: "0.32.0"
+          - os: macos-15
+            python: "3.12"
+            mlx: "0.32.0"
+          - os: macos-15
+            python: "3.13"
+            mlx: "0.32.0"
+          - os: macos-15
+            python: "3.14"
+            mlx: "0.32.0"
+          - os: macos-15
+            python: "3.13"
+            mlx: "0.25.2"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install test environment
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "mlx==${{ matrix.mlx }}" -e ".[test]"
+      - name: Run tests
+        run: python -m pytest -q
+
+  build:
+    name: Build and inspect distributions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "build>=1.2,<2" "twine>=6,<7"
+          python -m build
+      - name: Validate metadata and archive contents
+        run: |
+          python -m twine check dist/*
+          python scripts/check_dist.py dist | tee dist/SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  wheel-smoke:
+    name: Installed-wheel smoke test
+    needs:
+      - build
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v7
+        with:
+          name: distributions
+          path: dist
+      - name: Install wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "mlx==0.32.0"
+          python -m pip install --no-deps dist/*.whl
+      - name: Import outside the checkout
+        run: |
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
+          python -c 'from importlib.metadata import version; import mlx_kfac; print(version("mlx-kfac")); assert set(mlx_kfac.__all__) == {"CompiledKFACStep", "KFAC", "KFACLinear", "compile_kfac_step", "estimate_kfac_state_bytes", "instrument_model", "precondition_linear_gradient"}'
