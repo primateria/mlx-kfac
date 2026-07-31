@@ -1,5 +1,8 @@
 """Distributed safety probes run under ``mlx.launch``."""
 
+import os
+from pathlib import Path
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -184,4 +187,7 @@ mx.eval(layer.parameters(), optimizer.state)
 if int(optimizer.state["step"]) != 1:
     raise AssertionError(f"rank {rank}: recovery step failed")
 
+marker_dir = os.environ.get("MLX_KFAC_MARKER_DIR")
+if marker_dir:
+    Path(marker_dir, f"rank-{rank}.ok").touch()
 print(f"rank={rank} distributed_safety=ok")

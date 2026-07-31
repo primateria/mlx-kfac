@@ -1,5 +1,8 @@
 """Two-rank integration probe run by ``mlx.launch``."""
 
+import os
+from pathlib import Path
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -57,4 +60,7 @@ expected_natural = mx.linalg.solve(
 ).T
 if not bool(mx.allclose(layer.weight, -0.01 * expected_natural, atol=1e-5)):
     raise AssertionError(f"rank {rank}: distributed parameter mismatch")
+marker_dir = os.environ.get("MLX_KFAC_MARKER_DIR")
+if marker_dir:
+    Path(marker_dir, f"rank-{rank}.ok").touch()
 print(f"rank={rank} distributed_kfac=ok")
