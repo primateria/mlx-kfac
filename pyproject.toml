@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-kfac"
+version = "0.3.0"
+description = "A native MLX K-FAC optimizer"
+requires-python = ">=3.10"
+dependencies = ["mlx>=0.25"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
